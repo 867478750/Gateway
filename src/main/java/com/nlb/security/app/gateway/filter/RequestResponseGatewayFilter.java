@@ -10,12 +10,16 @@ import org.springframework.core.Ordered;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferFactory;
 import org.springframework.core.io.buffer.DataBufferUtils;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.http.server.reactive.ServerHttpRequestDecorator;
 import org.springframework.http.server.reactive.ServerHttpResponse;
 import org.springframework.http.server.reactive.ServerHttpResponseDecorator;
 import org.springframework.stereotype.Component;
+import org.springframework.util.MultiValueMap;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -28,7 +32,10 @@ import java.util.concurrent.TimeUnit;
 public class RequestResponseGatewayFilter implements GlobalFilter, Ordered {
     @Autowired
     StringRedisTemplate stringRedisTemplate;
-    private static int status =0;
+    @Autowired
+    RedisTemplate redisTemplate;
+
+    private static int status = 0;
 
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
@@ -36,17 +43,22 @@ public class RequestResponseGatewayFilter implements GlobalFilter, Ordered {
         DataBufferFactory bufferFactory = originalResponse.bufferFactory();
         ServerHttpRequest request = exchange.getRequest();
         URI uri = request.getURI();
+        HttpHeaders authorization = request.getHeaders();
         if(uri.getPath().contains("resource")) {
-            HttpHeaders authorization = request.getHeaders();
             List<String> authorization1 = authorization.get("Authorization");
             String key = authorization1.get(0);
             key=key.substring(7,key.length());
-            System.out.println(stringRedisTemplate.hasKey(key));
+            System.out.println(key);
             if(!stringRedisTemplate.hasKey("\""+key+"\"")){
                     status=1;
             }
         }
-        ServerHttpResponseDecorator decoratedResponse = new ServerHttpResponseDecorator(originalResponse) {
+
+        ServerHttpResponseDecorator decoratedResponse = new ServerHttpResponseDecorator(originalResponse);
+
+//处理响应
+        if(status==0) {
+            decoratedResponse = new ServerHttpResponseDecorator(originalResponse) {
                 @Override
                 public Mono<Void> writeWith(Publisher<? extends DataBuffer> body) {
                     if (body instanceof Flux) {
@@ -60,7 +72,7 @@ public class RequestResponseGatewayFilter implements GlobalFilter, Ordered {
                             String s = new String(content, Charset.forName("UTF-8"));
                             //TODO，s就是response的值，想修改、查看就随意而为了
                             StringBuilder ss = new StringBuilder(s);
-                            if(uri.getPath().equals("/app/oauth/token")) {
+                            if (uri.getPath().equals("/app/oauth/token")) {
                                 ss.insert(s.length(), "}");
                                 int token_type = s.indexOf("expires_in");
                                 ss.insert(token_type + 12, "\"");
@@ -68,20 +80,27 @@ public class RequestResponseGatewayFilter implements GlobalFilter, Ordered {
                                 ss.insert(scope - 1, "\"");
                                 JSONObject jsonObject = JSONObject.parseObject(ss.toString());
                                 Object access_token = jsonObject.get("access_token");
-                                stringRedisTemplate.opsForValue().set(JSON.toJSONString(access_token), JSON.toJSONString(access_token), 600, TimeUnit.SECONDS);
-                            }
-                            byte[] uppedContent=null;
-                            if(uri.getPath().contains("resource")){
-                                if(status==0){
-                                    uppedContent  = new String(content, Charset.forName("UTF-8")).getBytes();
-                                }else{
-                                    uppedContent = "token已经失效".getBytes();
-                                    status=1;
+                                ServerHttpRequestDecorator serverHttpRequestDecorator = new ServerHttpRequestDecorator(request);
+                                MultiValueMap<String, String> queryParams = serverHttpRequestDecorator.getQueryParams();
+                                List<String> stringList = queryParams.get("username");
+                                String name = stringList.get(0);
+                                if (!stringRedisTemplate.hasKey("\"" + name + "\"")) {
+                                    stringRedisTemplate.opsForValue().set(JSON.toJSONString(access_token), JSON.toJSONString(access_token), 600, TimeUnit.SECONDS);
+                                    stringRedisTemplate.opsForValue().set("\"" + name + "\"", JSON.toJSONString(access_token), 600, TimeUnit.SECONDS);
+                                } else {
+                                    String s1 = stringRedisTemplate.opsForValue().get("\"" + name + "\"");
+                                    stringRedisTemplate.delete(s1);
+                                    stringRedisTemplate.delete("\"" + name + "\"");
+                                    stringRedisTemplate.opsForValue().set(JSON.toJSONString(access_token), JSON.toJSONString(access_token), 600, TimeUnit.SECONDS);
+                                    stringRedisTemplate.opsForValue().set("\"" + name + "\"", JSON.toJSONString(access_token), 600, TimeUnit.SECONDS);
                                 }
-                            }else{
-                                uppedContent  = new String(content, Charset.forName("UTF-8")).getBytes();
                             }
-
+                            byte[] uppedContent = null;
+                            if (uri.getPath().contains("resource")) {
+                                uppedContent = new String(content, Charset.forName("UTF-8")).getBytes();
+                            } else {
+                                uppedContent = new String(content, Charset.forName("UTF-8")).getBytes();
+                            }
                             return bufferFactory.wrap(uppedContent);
                         }));
                     }
@@ -90,15 +109,41 @@ public class RequestResponseGatewayFilter implements GlobalFilter, Ordered {
                     return super.writeWith(body);
                 }
             };
+        } else{
+            decoratedResponse = new ServerHttpResponseDecorator(originalResponse) {
+                @Override
+                public Mono<Void> writeWith(Publisher<? extends DataBuffer> body) {
+                    if (body instanceof Flux) {
+                        Flux<? extends DataBuffer> fluxBody = (Flux<? extends DataBuffer>) body;
+                        return super.writeWith(fluxBody.map(dataBuffer -> {
+                            // probably should reuse buffers
+                            byte[] content = new byte[dataBuffer.readableByteCount()];
+                            dataBuffer.read(content);
+                            //释放掉内存
+                            DataBufferUtils.release(dataBuffer);
+                            String s = new String(content, Charset.forName("UTF-8"));
+                            dataBuffer=null;
+                            //TODO，s就是response的值，想修改、查看就随意而为了
+                            byte[] uppedContent = new String("token无效".getBytes(), Charset.forName("UTF-8")).getBytes();
+                            return bufferFactory.wrap(uppedContent);
+                        }));
+                    }
+                    // if body is not a flux. never got there.
+                    return super.writeWith(body);
+                }
+            };
+            decoratedResponse.setStatusCode(HttpStatus.BAD_GATEWAY);
+            status=0;
+
+        }
+
+            // replace response with decorator
+            return chain.filter(exchange.mutate().response(decoratedResponse).build());
+        }
 
 
-        // replace response with decorator
-        return chain.filter(exchange.mutate().response(decoratedResponse).build());
-    }
-
-
-    @Override
-    public int getOrder() {
-        return -1;
-    }
+        @Override
+        public int getOrder() {
+            return -1;
+        }
 }
